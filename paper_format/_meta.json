@@ -1,0 +1,8 @@
+{
+  "slug": "paper-writing",
+  "version": "1.2.0",
+  "name": "paper-writing",
+  "category": "generation",
+  "author": "OfficeSkillAgent",
+  "description": "学术论文写作器：按标准论文格式撰写论文内容并给出排版与参考文献著录规范。"
+}

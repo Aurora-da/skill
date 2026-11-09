@@ -1,0 +1,68 @@
+# ============================================================
+# Skill 仓库忽略规则
+# 原则：只提交 skill 内容（SKILL.md / _meta.json / references 等），
+#       忽略本机 IDE 配置、Python 缓存、密钥与临时产物。
+# ============================================================
+
+# ---------- 系统与资源管理器 ----------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+._*
+
+# ---------- 编辑器 / IDE ----------
+# JetBrains 工程配置，每台机器都不一样；如需共享代码风格可删掉本行，
+# 改用 .idea/.gitignore 精确忽略（workspace.xml、shelf、dataSources 等）。
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.~*
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------- 环境变量与密钥 ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+
+# ---------- Office 临时文件 / 锁定文件 ----------
+# 生成 Word/Excel/PPT 时产生的临时文件，切勿提交
+~$*.docx
+~$*.xlsx
+~$*.pptx
+~$*.doc
+~$*.xls
+~$*.ppt
+.~lock.*#
+
+# ---------- 本地日志与临时输出 ----------
+*.log
+/tmp/
+/scratch/
+/output/
+/.cache/
