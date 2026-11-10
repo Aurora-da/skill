@@ -2,8 +2,10 @@
 """实验报告 Markdown -> 规范 DOCX。
 
 用法：
-    python3 build_report.py report.md -o 实验报告.docx
-    python3 build_report.py report.md -o 实验报告.docx --template 模板.docx
+    python build_report.py report.md -o 实验报告.docx
+    python build_report.py report.md -o 实验报告.docx --template 模板.docx
+
+封面默认不生成；需要时在元信息写 cover: simple 或 cover: page。
 
 report.md 结构：
     title: 实验三 进程调度
@@ -37,12 +39,22 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
+try:  # Windows 控制台默认 GBK，中文提示会乱码
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 BODY_SIZE = 12          # 小四
 CAPTION_SIZE = 10.5     # 五号
 CODE_SIZE = 10.5
 PAGE_W, PAGE_H = 21.0, 29.7
 MARGIN_TB, MARGIN_LR = 2.54, 3.17
 USABLE_W = PAGE_W - 2 * MARGIN_LR
+IN_TEMPLATE = False     # 模板模式：正文沿用模板 Normal，不强制字号字体
+TEMPLATE_NUMBERING = "arabic"
+REF_TYPES = r"(?:J|M|D|S|C|N|R|P|EB|DB|CP|A|CM|DS|PP|G|Z)(?:/(?:OL|EB))?"
+CITE_RE = re.compile(r"\[\d+(?:\s*[,，]\s*\d+|\s*[-–—]\s*\d+)*\]")
 META_KEYS = {
     "title", "course", "name", "student_id", "class_name", "class",
     "major", "teacher", "date", "cover", "subject", "school",
@@ -50,9 +62,10 @@ META_KEYS = {
 
 
 # ---------------------------------------------------------------- utilities
-def set_run_font(run, size=BODY_SIZE, ascii_font="Times New Roman",
+def set_run_font(run, size=None, ascii_font="Times New Roman",
                  ea_font="宋体", bold=False, italic=False, color=None):
-    run.font.size = Pt(size)
+    if size is not None:
+        run.font.size = Pt(size)
     run.font.bold = bold
     run.font.italic = italic
     run.font.name = ascii_font
@@ -92,6 +105,11 @@ def is_cjk(ch):
     return bool(ch) and ("\u4e00" <= ch <= "\u9fff" or ch in CJK_PUNCT)
 
 
+def disp_width(text):
+    """按显示宽度估算：中文 2，英文数字 1。"""
+    return sum(2 if is_cjk(ch) else 1 for ch in text)
+
+
 def smart_join(parts):
     out = ""
     for p in parts:
@@ -109,6 +127,54 @@ def norm_heading(text):
     s = re.sub(r"^[0-9]+(\.[0-9]+)*[.、)]?\s*", "", s)
     s = re.sub(r"^[一二三四五六七八九十]+[、.]\s*", "", s)
     return re.sub(r"\s+", "", s)
+
+
+GENERIC_WORDS = ("实验", "报告", "基本", "主要", "相关", "内容", "过程",
+                 "与", "及", "和", "的", "器材", "仪器", "设备", "用品")
+
+
+def strip_generic(text):
+    s = norm_heading(text)
+    for w in GENERIC_WORDS:
+        s = s.replace(w, "")
+    return s
+
+
+def cn_number(n):
+    digits = "零一二三四五六七八九"
+    if n < 10:
+        return digits[n]
+    if n < 20:
+        return "十" + (digits[n % 10] if n % 10 else "")
+    return digits[n // 10] + "十" + (digits[n % 10] if n % 10 else "")
+
+
+PLACEHOLDER_RE = re.compile(r"模板占位|占位文字|占位符|此处填写|请在此|请填写|待填写|（请.{0,8}填写.{0,8}）")
+
+
+def is_placeholder_text(text):
+    t = text.strip()
+    return bool(t) and bool(PLACEHOLDER_RE.search(t))
+
+
+def add_text_runs(p, text, size=None):
+    """正文文本，把 [1]、[1,2]、[1-3] 形式的引用自动设为上标。"""
+    pos = 0
+    for m in CITE_RE.finditer(text):
+        if m.start() > pos:
+            run = p.add_run(text[pos:m.start()])
+            if size is not None:
+                set_run_font(run, size)
+        run = p.add_run(m.group(0))
+        if size is not None:
+            set_run_font(run, size)
+        run.font.superscript = True
+        pos = m.end()
+    tail = text[pos:]
+    if tail or pos == 0:
+        run = p.add_run(tail)
+        if size is not None:
+            set_run_font(run, size)
 
 
 # ---------------------------------------------------------------- parsing
@@ -221,7 +287,7 @@ def parse_blocks(lines):
             continue
 
         if re.match(r"^[-*+]\s+", s) or re.match(r"^\d+[.)]\s+", s):
-            items, ordered = [], None
+            items, ordered, list_style = [], None, "paren"
             while i < n:
                 t = lines[i].strip()
                 mo = re.match(r"^[-*+]\s+(.*)$", t)
@@ -230,17 +296,19 @@ def parse_blocks(lines):
                     ordered = False if ordered is None else ordered
                     items.append(mo.group(1).strip())
                 elif mn:
-                    ordered = True if ordered is None else ordered
+                    if ordered is None:
+                        ordered, list_style = True, "dot"
                     items.append(mn.group(2).strip())
                 elif t and t.startswith("  ") and items:
                     items[-1] += t
                 else:
                     break
                 i += 1
-            blocks.append({"type": "list", "ordered": bool(ordered), "items": items})
+            blocks.append({"type": "list", "ordered": bool(ordered),
+                           "style": list_style, "items": items})
             continue
 
-        if re.match(r"^\[\d+\]", s) and re.search(r"\[(J|M|D|S|C|N|R|P|EB|DB|CP)\]", s):
+        if re.match(r"^\[\d+\]", s) and re.search(r"\[%s\]" % REF_TYPES, s):
             blocks.append({"type": "ref", "text": s})
             i += 1
             continue
@@ -347,18 +415,28 @@ def add_page_number(doc):
     footer = doc.sections[0].footer
     p = footer.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run()
-    set_run_font(run, CAPTION_SIZE)
 
     fld_begin = OxmlElement("w:fldChar")
     fld_begin.set(qn("w:fldCharType"), "begin")
     instr = OxmlElement("w:instrText")
     instr.set(qn("xml:space"), "preserve")
     instr.text = " PAGE "
+    fld_sep = OxmlElement("w:fldChar")
+    fld_sep.set(qn("w:fldCharType"), "separate")
     fld_end = OxmlElement("w:fldChar")
     fld_end.set(qn("w:fldCharType"), "end")
-    for el in (fld_begin, instr, fld_end):
-        run._element.append(el)
+
+    head = p.add_run()
+    set_run_font(head, CAPTION_SIZE)
+    for el in (fld_begin, instr, fld_sep):
+        head._element.append(el)
+
+    result = p.add_run("1")
+    set_run_font(result, CAPTION_SIZE)
+
+    tail = p.add_run()
+    set_run_font(tail, CAPTION_SIZE)
+    tail._element.append(fld_end)
 
 
 def add_cover(doc, meta, mode):
@@ -403,16 +481,17 @@ def add_cover(doc, meta, mode):
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.space_before = Pt(12)
     p.paragraph_format.space_after = Pt(24)
-    set_run_font(p.add_run(title or "实验报告"), 16, ea_font="黑体", bold=True)
+    set_run_font(p.add_run("实验报告"), 22, ea_font="黑体", bold=True)
 
     for line in info:
         q = doc.add_paragraph()
         q.paragraph_format.first_line_indent = Pt(0)
         q.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        set_run_font(q.add_run(line), BODY_SIZE)
+        q.paragraph_format.space_before = Pt(6)
+        q.paragraph_format.space_after = Pt(6)
+        set_run_font(q.add_run(line), 14)
 
-    if mode == "page":
-        doc.add_page_break()
+    doc.add_page_break()
 
 
 # ---------------------------------------------------------------- rendering
@@ -426,17 +505,25 @@ def add_caption(doc, text):
 
 def add_paragraph(doc, text):
     p = doc.add_paragraph()
-    set_run_font(p.add_run(text), BODY_SIZE)
+    add_text_runs(p, text, None if IN_TEMPLATE else BODY_SIZE)
     return p
 
 
-def add_list(doc, items, ordered):
+def add_list(doc, items, ordered, style="paren"):
     for idx, item in enumerate(items, 1):
         p = doc.add_paragraph()
         p.paragraph_format.first_line_indent = Pt(0)
         p.paragraph_format.left_indent = Pt(24)
-        prefix = f"（{idx}）" if ordered else "• "
-        set_run_font(p.add_run(prefix + item), BODY_SIZE)
+        if not ordered:
+            prefix = "• "
+        elif style == "dot":
+            prefix = f"{idx}. "
+        else:
+            prefix = f"（{idx}）"
+        run = p.add_run(prefix)
+        if not IN_TEMPLATE:
+            set_run_font(run, BODY_SIZE)
+        add_text_runs(p, item, None if IN_TEMPLATE else BODY_SIZE)
 
 
 def add_figure(doc, caption, path, width, base_dir):
@@ -452,7 +539,7 @@ def add_figure(doc, caption, path, width, base_dir):
     p.paragraph_format.space_after = Pt(0)
     p.paragraph_format.keep_with_next = True
     run = p.add_run()
-    run.add_picture(full, width=Cm(min(width or 12.0, USABLE_W)))
+    run.add_picture(full, width=Cm(min(width or 9.0, USABLE_W)))
     add_caption(doc, caption)
 
 
@@ -494,7 +581,7 @@ def add_table(doc, caption, rows):
     table = doc.add_table(rows=len(rows), cols=cols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
-    lens = [max((len(r[c]) if c < len(r) else 0) for r in rows) for c in range(cols)]
+    lens = [max((disp_width(r[c]) if c < len(r) else 0) for r in rows) for c in range(cols)]
     total = sum(lens) or cols
     ratio = [max(0.16, v / total) for v in lens]
     ratio = [v / sum(ratio) for v in ratio]
@@ -522,6 +609,10 @@ def add_table(doc, caption, rows):
             p.paragraph_format.line_spacing = 1.0
             set_run_font(p.add_run(text), CAPTION_SIZE, bold=(r == 0))
     _clear_borders(table)
+    tr_pr = table.rows[0]._tr.get_or_add_trPr()
+    tbl_header = OxmlElement("w:tblHeader")
+    tbl_header.set(qn("w:val"), "true")
+    tr_pr.append(tbl_header)
     spacer = doc.add_paragraph()
     spacer.paragraph_format.first_line_indent = Pt(0)
     spacer.paragraph_format.space_before = Pt(0)
@@ -565,7 +656,8 @@ def add_equation(doc, number, text):
     pf.tab_stops.add_tab_stop(Cm(USABLE_W / 2), WD_TAB_ALIGNMENT.CENTER)
     pf.tab_stops.add_tab_stop(Cm(USABLE_W), WD_TAB_ALIGNMENT.RIGHT)
     run = p.add_run("\t" + text + ("\t" + number if number else ""))
-    set_run_font(run, BODY_SIZE, ascii_font="Cambria Math", ea_font="Cambria Math")
+    set_run_font(run, None if IN_TEMPLATE else BODY_SIZE,
+                 ascii_font="Cambria Math", ea_font="Cambria Math")
 
 
 def add_ref(doc, text):
@@ -589,7 +681,7 @@ def render_block(doc, b, base_dir):
     elif t == "p":
         add_paragraph(doc, b["text"])
     elif t == "list":
-        add_list(doc, b["items"], b["ordered"])
+        add_list(doc, b["items"], b["ordered"], b.get("style", "paren"))
     elif t == "figure":
         add_figure(doc, b["caption"], b["path"], b["width"], base_dir)
     elif t == "table":
@@ -608,41 +700,84 @@ def find_template_heading(doc, text):
     target = norm_heading(text)
     if not target:
         return None
-    candidates = []
-    for p in doc.paragraphs:
-        style = (p.style.name or "").lower()
-        candidates.append(p)
+    candidates = [p for p in doc.paragraphs
+                  if p.text.strip() and len(p.text.strip()) <= 40]
+    for p in candidates:
         if target == norm_heading(p.text):
             return p
     for p in candidates:
-        if target and target in norm_heading(p.text):
+        c = norm_heading(p.text)
+        if len(c) >= 3 and target in c:
             return p
+    for p in candidates:
+        c = norm_heading(p.text)
+        if len(c) >= 3 and c in target:
+            return p
+    stripped = strip_generic(text)
+    if len(stripped) >= 2:
+        for p in candidates:
+            if strip_generic(p.text) == stripped:
+                return p
     return None
 
 
 def find_tail_anchor(doc):
     """模板末尾的固定栏目（评语、成绩、签字等），补充章节应插在它之前。"""
-    for p in reversed(doc.paragraphs):
-        if re.search(r"评语|成绩|评分|意见|签字", p.text):
+    paras = [p for p in doc.paragraphs if p.text.strip()]
+    for p in reversed(paras[-15:]):
+        t = p.text.strip()
+        if (len(t) <= 40 and re.search(r"评语|成绩|评分|意见|签字", t)
+                and not re.match(r"^(图|表)", t)):
             return p
     return None
+
+
+def detect_template_numbering(doc):
+    for p in doc.paragraphs[:60]:
+        if re.match(r"^[一二三四五六七八九十]+、", p.text.strip()):
+            return "cn"
+    return "arabic"
+
+
+def localize_heading(text, level):
+    if level == 1 and IN_TEMPLATE and TEMPLATE_NUMBERING == "cn":
+        m = re.match(r"^(\d+)\s+(.*)$", text)
+        if m:
+            return cn_number(int(m.group(1))) + "、" + m.group(2)
+    return text
 
 
 def append_section(doc, section, base_dir, before_p=None):
     body = doc.element.body
     before = list(body)
-    try:
-        doc.add_heading(section["heading"], level=section["level"] or 1)
-    except KeyError:
-        p = doc.add_paragraph()
-        p.paragraph_format.first_line_indent = Pt(0)
-        set_run_font(p.add_run(section["heading"]), 14, ea_font="黑体", bold=True)
+    if section["heading"]:
+        heading = localize_heading(section["heading"], section["level"] or 1)
+        try:
+            doc.add_heading(heading, level=section["level"] or 1)
+        except KeyError:
+            p = doc.add_paragraph()
+            p.paragraph_format.first_line_indent = Pt(0)
+            set_run_font(p.add_run(heading), None if IN_TEMPLATE else 14,
+                         ea_font="黑体", bold=True)
     for b in section["blocks"]:
         render_block(doc, b, base_dir)
     new_els = [el for el in body if el not in before]
     if before_p is not None:
         for el in new_els:
             before_p.addprevious(el)
+
+
+def render_preamble_into_template(doc, blocks, base_dir):
+    """首个标题之前的正文放到文档开头，而不是文末。"""
+    body = doc.element.body
+    first = next((el for el in body if el.tag != qn("w:sectPr")), None)
+    before = list(body)
+    for b in blocks:
+        render_block(doc, b, base_dir)
+    new_els = [el for el in body if el not in before]
+    for el in new_els:
+        if first is not None:
+            first.addprevious(el)
 
 
 def render_section_into_template(doc, section, base_dir):
@@ -662,10 +797,18 @@ def render_section_into_template(doc, section, base_dir):
     for el in new_els:
         cursor.addnext(el)
         cursor = el
+    nxt = cursor.getnext()
+    while nxt is not None and nxt.tag == qn("w:p"):
+        if not is_placeholder_text("".join(nxt.itertext())):
+            break
+        following = nxt.getnext()
+        body.remove(nxt)
+        nxt = following
 
 
 # ---------------------------------------------------------------- main
 def main():
+    global IN_TEMPLATE, TEMPLATE_NUMBERING
     ap = argparse.ArgumentParser(description="实验报告 Markdown 转 DOCX")
     ap.add_argument("source", help="report.md 路径")
     ap.add_argument("-o", "--output", required=True, help="输出 docx 路径")
@@ -674,7 +817,7 @@ def main():
 
     if not os.path.exists(args.source):
         sys.exit(f"源文件不存在：{args.source}")
-    with open(args.source, encoding="utf-8") as f:
+    with open(args.source, encoding="utf-8-sig") as f:
         lines = f.read().replace("\r\n", "\n").split("\n")
 
     meta, body_lines = parse_meta(lines)
@@ -686,21 +829,23 @@ def main():
             sys.exit(f"模板不存在：{args.template}")
         doc = Document(args.template)
         ensure_aux_styles(doc)
+        IN_TEMPLATE = True
+        TEMPLATE_NUMBERING = detect_template_numbering(doc)
         for section in split_sections(blocks):
             if section["heading"]:
                 render_section_into_template(doc, section, base_dir)
             else:
-                for b in section["blocks"]:
-                    render_block(doc, b, base_dir)
+                render_preamble_into_template(doc, section["blocks"], base_dir)
     else:
         doc = Document()
         setup_document(doc)
-        cover = meta.get("cover", "auto")
+        cover = meta.get("cover", "none")
         if cover == "auto":
             cover = "simple" if meta.get("title") and (
                 meta.get("name") or meta.get("course") or meta.get("student_id")) else "none"
         if cover not in ("none", "simple", "page"):
-            cover = "simple"
+            print(f"[warn] cover 取值无效：{cover}，按 none 处理")
+            cover = "none"
         add_cover(doc, meta, cover)
         for b in blocks:
             render_block(doc, b, base_dir)
